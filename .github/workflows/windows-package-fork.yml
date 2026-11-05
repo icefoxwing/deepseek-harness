@@ -1,0 +1,239 @@
+name: Package Desktop · Windows (fork)
+
+# Working copy of the official `Package Desktop · Windows` flow for a personal fork.
+#
+# Differences from the upstream workflow, which targets the internal self-hosted runner
+# `dsh-win-package-trial` plus machine-owned presets/secrets:
+#   * runs on GitHub's hosted `windows-latest` runner (Windows Server x64);
+#   * unsigned only — no EV token, no signing secrets;
+#   * the public settings an unsigned build needs (app id, update channel, mandatory-update
+#     policy origin) are written to a temporary `apps/desktop/.env.windows` at run time and are
+#     not committed;
+#   * installs Visual C++ Build Tools (vswhere + cl.exe are hard requirements of the flow) and a
+#     Windows `tar`, which recent Windows Server images no longer ship.
+#
+# The packaging command itself is the upstream one, unmodified:
+#   pnpm run package:desktop:win:x64 --build-version <version> --unsigned
+# The result is an unsigned NSIS installer artifact. It is not publishable and cannot be used
+# for automatic updates; Windows SmartScreen will warn about it.
+#
+# This file is fork-only tooling: do not open upstream pull requests with it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '构建版本号：留空使用产品版本；可填 0.2.1-rc.2 或扩展构建号 0.2.1-rc.2.20261106.1'
+        type: string
+        required: false
+        default: ''
+      policy_origin:
+        description: '强制更新策略服务源（HTTPS 源地址，无路径）；留空使用离线占位源，产物仅用于本地安装测试'
+        type: string
+        required: false
+        default: ''
+      auth_origin:
+        description: '登录来源白名单（HTTPS 源地址，可留空）；仅当 policy_origin 是真实服务时填写'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-package-fork
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      DSH_DESKTOP_UPDATE_CHANNEL: nightly
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Report selected source
+        run: |
+          node -e "const fs=require('node:fs');const v=JSON.parse(fs.readFileSync('package.json','utf8')).version;console.log('Product version: '+v)"
+
+      - uses: pnpm/action-setup@v5.0.0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Install locked dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          exit $LASTEXITCODE
+
+      - name: Install Visual C++ Build Tools
+        # package-target.ts refuses to run without vswhere.exe reporting a VC++ toolset, and
+        # prepare-windows-installer.ps1 compiles installer/window-frame.cpp with cl.exe.
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $haveVc = $false
+          if (Test-Path -LiteralPath $vswhere) {
+            $found = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            $haveVc = [bool]$found
+          }
+          if ($haveVc) {
+            Write-Output 'Visual C++ Build Tools already present.'
+          } else {
+            Write-Output 'Installing Visual C++ Build Tools (this takes several minutes).'
+            $installer = Join-Path $env:RUNNER_TEMP 'vs_buildtools.exe'
+            Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vs_buildtools.exe' -OutFile $installer
+            $arguments = @(
+              '--quiet', '--wait', '--norestart', '--nocache',
+              '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+              '--add', 'Microsoft.VisualStudio.Workload.MSBuildTools'
+            )
+            $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+            if ($process.ExitCode -notin @(0, 3010)) { throw "Build Tools installer exited with $($process.ExitCode)" }
+          }
+          $found = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $found) { throw 'Visual C++ Build Tools are unavailable after installation' }
+          Write-Output "Visual C++ tools: $found"
+
+      - name: Ensure a Windows tar is on PATH
+        # The packaging flow probes tar, and recent windows-latest images ship bsdtar only inside
+        # System32 where it may be absent from PATH for spawned child processes.
+        run: |
+          if (Get-Command tar -CommandType Application -ErrorAction SilentlyContinue) {
+            Write-Output "tar: $((Get-Command tar -CommandType Application | Select-Object -First 1).Source)"
+            exit 0
+          }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/tools" | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/skeeto/w64devkit/releases/download/v2.11.0/w64devkit-x64-2.11.0.7z.exe' -OutFile "$env:RUNNER_TEMP/w64devkit.exe"
+          & "$env:RUNNER_TEMP/w64devkit.exe" -y -o"$env:RUNNER_TEMP/tools" | Out-Null
+          "$env:RUNNER_TEMP/tools/w64devkit/bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          exit $LASTEXITCODE
+
+      - name: Write unsigned build settings
+        env:
+          POLICY_ORIGIN: ${{ inputs.policy_origin }}
+          AUTH_ORIGIN: ${{ inputs.auth_origin }}
+        run: |
+          # The `test` deployment always requires a nonempty allowedAuthOrigins list, so the
+          # offline default carries a placeholder that satisfies validation without reachability.
+          $origin = if ($env:POLICY_ORIGIN) { $env:POLICY_ORIGIN.TrimEnd('/') } else { 'https://login.test.deepseek.example' }
+          if ($origin -notmatch '^https://[^/]+$') { throw 'policy_origin must be an HTTPS origin without path' }
+          $auth = if ($env:AUTH_ORIGIN) { $env:AUTH_ORIGIN.TrimEnd('/') } else { $origin }
+          if ($auth -notmatch '^https://[^/]+$') { throw 'auth_origin must be an HTTPS origin without path' }
+          $config = '{"allowedAuthOrigins":["' + $auth + '"]}'
+          $lines = @(
+            '# Generated by the fork packaging workflow for an unsigned test build.',
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness',
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=test',
+            "DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=$origin",
+            "DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='$config'",
+            'DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4'
+          )
+          Set-Content -LiteralPath 'apps/desktop/.env.windows' -Value $lines -Encoding utf8
+          Write-Output "Mandatory-update policy origin: $origin"
+
+      - name: Resolve build version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          $product = (Get-Content -Raw 'apps/desktop/package.json' | ConvertFrom-Json).version
+          $requested = $env:REQUESTED_VERSION
+          if (-not $requested) { $requested = $product }
+          if ($requested -ne $product -and $requested -notlike "$product.*") {
+            throw "Build version $requested must be the product version $product or an extended build version such as $product.20261106.1"
+          }
+          "version=$requested" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Output "Build version: $requested"
+
+      - name: Check packaging configuration and toolchain
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          pnpm run package:desktop:win:x64 --check --build-version $env:PACKAGE_VERSION --unsigned
+          exit $LASTEXITCODE
+
+      - name: Build unsigned installer
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          pnpm run package:desktop:win:x64 --build-version $env:PACKAGE_VERSION --unsigned
+          exit $LASTEXITCODE
+
+      - name: Collect installer
+        id: collect
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        # Unsigned builds write to targets/win-x64/unsigned-artifacts/ with the electron-builder
+        # artifact name deepseek-harness-<version>-win-x64-unsigned.exe (see
+        # apps/desktop/scripts/electron-builder-config.mjs artifactName).
+        run: |
+          $source = 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $expected = "deepseek-harness-$($env:PACKAGE_VERSION)-win-x64-unsigned.exe"
+          $path = Join-Path $source $expected
+          if (-not (Test-Path -LiteralPath $path)) {
+            $available = Get-ChildItem -LiteralPath $source -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+            throw "Expected $expected under $source; found: $($available -join ', ')"
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'installer'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item -LiteralPath $path -Destination $out
+          "directory=$out" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Verify installer shape
+        env:
+          INSTALLER_DIR: ${{ steps.collect.outputs.directory }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $expected = "deepseek-harness-$($env:PACKAGE_VERSION)-win-x64-unsigned.exe"
+          $exe = Get-Item -LiteralPath (Join-Path $env:INSTALLER_DIR $expected)
+          $sha = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          if ($signature.Status -eq 'Valid') { throw 'Expected an unsigned installer' }
+          $head = [IO.File]::ReadAllBytes($exe.FullName)[0..1]
+          if (-not ($head[0] -eq 0x4D -and $head[1] -eq 0x5A)) { throw 'Installer is not a PE executable' }
+          Write-Output "Installer: $($exe.Name)  size=$([math]::Round($exe.Length / 1MB, 1)) MiB"
+          Write-Output "SHA256:    $sha"
+          Write-Output "Signature: $($signature.Status)"
+          @(
+            "name: $($exe.Name)"
+            "size_bytes: $($exe.Length)"
+            "sha256: $sha"
+            "version: $($env:PACKAGE_VERSION)"
+            "authenticode: $($signature.Status)"
+            "source_commit: $env:GITHUB_SHA"
+            "source_ref: $env:GITHUB_REF_NAME"
+          ) | Set-Content -LiteralPath (Join-Path $env:INSTALLER_DIR 'installer-info.txt') -Encoding utf8
+
+      - name: Retain packaging diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-package-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          include-hidden-files: true
+          path: apps/desktop/.desktop-build/packaging-runs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Retain unsigned installer
+        if: success()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-x64-unsigned-${{ steps.version.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          include-hidden-files: true
+          path: |
+            ${{ steps.collect.outputs.directory }}/*
+            ${{ runner.temp }}/installer-info.txt
+          if-no-files-found: error
+          retention-days: 14
